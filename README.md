@@ -11,12 +11,56 @@ No game data is included. You need your own copies of the games.
 
 ## Install
 
-1. Build the zip (or use `dist/crimson_skies_importer-1.1.0.zip`):
+1. Build the zip (or use `dist/crimson_skies_importer-1.2.0.zip`):
    `blender --command extension build --source-dir crimson_skies_importer --output-dir dist`
 2. In Blender, go to *Edit > Preferences > Get Extensions*, open the drop-down at the top right,
    choose *Install from Disk…* and pick the zip.
 
-Everything is under **File > Import > Crimson Skies**.
+There are two ways in: the **asset browser** in the 3D view's sidebar (*N > Crimson Skies*), or
+**File > Import > Crimson Skies**.
+
+## Asset browser
+
+1. Choose **PC** or **Xbox** at the top of the panel, then set the source. For PC, that's the
+   Crimson Skies install folder (the one holding `ZBD` and `GOSDATA`). For Xbox, it's the
+   disc image (`.iso` / `.xiso`, or a folder of extracted packages).
+2. Press **Scan**. This indexes every importable asset in about a second. The scan is cached on
+   disk, so the list comes back after a restart, after loading a file, and after switching games,
+   without scanning again. If the source's files change, the panel says the cache is stale.
+3. Use **Search** (every word must match the name, category or source) and the **Category**
+   menu to narrow the list. Then tick assets and press **Import**, or highlight one row and
+   import that.
+
+| Game | Categories |
+|---|---|
+| PC | Player Aircraft, AI Aircraft, Characters & Props (from `planes.zbd`); Levels (each chapter world, alone or with a mission's animations); Level Objects, Effects, Destroyed States (each chapter's other root objects, with templates repeated across chapters listed once) |
+| Xbox | Levels, Multiplayer Levels, Player / AI / Ambient Aircraft, Other Packages (whole packages); Props, Vehicles, Zeppelins, Turrets & Defenses, Characters, Bosses, Pickups & Targets, Skies, Effects, Aircraft Models, Debris & Damage (each distinct model of the level packages) |
+
+A level object imported on its own keeps its world position.
+
+### Preferences
+
+*Edit > Preferences > Add-ons > Crimson Skies Importer* holds the sources and the import options
+that the browser and the File menu share. The same options are in the browser's *Import Options*
+subpanel.
+
+| Option | Default | What it does |
+|---|---|---|
+| Import LODs | Off | PC: the lower levels of detail go into a `<model> LODs` collection with its visibility off. The Xbox game ships no LOD models. |
+| Import Collisions | Off | Xbox: the `collide_N` cards and `boundbox` nodes go into a `<model> Collision` collection, as wireframe and hidden from renders. PC has no separate collision meshes: each object gets a `cs_collision` property (`surface`, `bbox` or `none`, from the node's flags), and every bounding-box collider gets a wireframe box. |
+| Damage States | Off | **Off**: damage panels, damage-state subtrees, destroyed pieces and debris or wreck models are left out. **On**: they are imported in place and visible. **Hidden**: they go into their own `<model> Damage` collection, with its visibility off. |
+| Animations, Pack Images | On | As in the File menu importers. |
+| Livery / Team Skin | Fortune Hunters / No Team | The PC livery painted at import, and the Xbox multiplayer skin. |
+
+Damage states are the PC aircraft's `pdp*`/`pcdp*` panels, `player_damage_on/off`, `destroyed`
+and its pieces, cockpit bullet holes and the destroyed variants of world destructibles. On Xbox
+they are the `<model>_dmg1`…`_dmgN` subtrees (`_dmg0` is the healthy state), `*debris*` nodes and
+models, and the `*_fusalage` wreck models. A debris model you pick in the browser is always
+imported.
+
+Preferences are also written to `settings.json` in the add-on's user folder, next to the scan
+cache, and restored when the add-on is enabled. They survive a factory reset or a reinstall.
+*Clear Scan Cache* in the preferences deletes the cached scans.
 
 ## PC (Crimson Skies)
 
@@ -28,9 +72,8 @@ Everything is under **File > Import > Crimson Skies**.
 Options:
 
 - **Root Filter**: comma-separated names or wildcards, for example `player_bhawk` or `player_*`.
-- **LOD**: *Highest only* (the default) or *All*.
-- **Flight-Ready State**: hides the damage panels, destroyed pieces, shadow and propeller spin
-  frames that the game starts hidden. **Cockpit Interior** also imports the separate cockpit model.
+- **LODs, collisions and damage states** follow the add-on preferences (see above).
+- **Flight-Ready State**: hides the shadow and propeller spin frames that the game starts hidden. **Cockpit Interior** also imports the separate cockpit model.
 - **World Content Only** (levels): imports the world node and its partitioned scenery, and leaves
   out effect templates such as bullet holes and letterbox bars.
 - **Mission** (levels): a mission folder such as `M02`, whose `mis_anim.zbd` animations are added
@@ -149,5 +192,9 @@ mesh count except `mp_CH1` (see Limitations). The layouts are written up in the 
 
 `tests/blender_test.py` imports one case headless, saves a .blend and renders a preview, for
 example `blender -b --factory-startup --python tests/blender_test.py -- pc_level_c1`.
-`tests/operator_test.py` runs every import operator end to end. The default output folder is
+`tests/operator_test.py` runs every import operator end to end.
+`tests/browser_test.py` drives the sidebar browser headless: scan, search, every LOD, collision
+and damage setting, the livery panel following the imported aircraft, and settings and cache
+surviving a reset. Set `BLENDER_USER_CONFIG` to a test folder first, so its settings and cache
+stay out of your own. `tests/ui_screenshot.py` opens a window and screenshots the sidebar. The default output folder is
 `E:\tests\CrimsonSkies_Importer_20261123`.

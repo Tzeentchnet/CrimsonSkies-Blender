@@ -5,6 +5,10 @@ compiled SI-script animations (cam_anim.zbd / mis_anim.zbd).
 Xbox (Crimson Skies: High Road to Revenge, 2003): read straight from the disc image (.iso /
 .xiso) or from extracted files: resource packages (.bin, also inside airplanes.zip),
 compiled .x models, textures, .anm animations and level worlds.
+
+Two ways in: File > Import > Crimson Skies, or the asset browser in the 3D view's sidebar
+(N > Crimson Skies), which scans a PC install folder or the Xbox disc image into a searchable,
+categorised list. LODs, collisions and damage states are add-on preferences shared by both.
 """
 
 import os
@@ -16,9 +20,9 @@ from bpy_extras.io_utils import ImportHelper
 bl_info = {
     "name": "Crimson Skies Importer",
     "author": "CrimsonSkies-Blender",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 4, 0),
-    "location": "File > Import > Crimson Skies",
+    "location": "File > Import > Crimson Skies; View3D > Sidebar > Crimson Skies",
     "description": "Import models, materials, animations and levels from Crimson Skies PC and Xbox",
     "category": "Import-Export",
 }
@@ -46,6 +50,13 @@ def _props(op, *mixins, **extra):
     return kw
 
 
+def _shared(fn):
+    """The LOD / collision / damage choices from the add-on preferences, for the menu operators."""
+    from . import prefs
+    p = prefs.get()
+    return {k: v for k, v in fn(p).items() if k in ("import_lods", "import_collisions", "damage_states")}
+
+
 def _report(op):
     def r(msg):
         print("[CrimsonSkies]", msg)
@@ -65,8 +76,6 @@ class _CommonProps:
 # ----------------------------------------------------------------------------------------- PC
 
 class _PcProps(_CommonProps):
-    lod: EnumProperty(name="LOD", items=(("HIGHEST", "Highest only", "Import only the most detailed LOD"),
-                                         ("ALL", "All", "Import every LOD level")), default="HIGHEST")
     hide_inactive: BoolProperty(name="Hide Inactive Nodes", default=True,
                                 description="Hide nodes the game starts inactive (damage states, destroyed parts)")
     import_normals: BoolProperty(name="Custom Normals", default=True)
@@ -88,8 +97,8 @@ class CS_OT_import_pc_models(bpy.types.Operator, ImportHelper, _PcProps):
     arrange_spacing: FloatProperty(name="Arrange Spacing", default=25.0, min=0.0,
                                    description="Lay several models out in a grid (0 = all at the origin)")
     display_state: BoolProperty(name="Flight-Ready State", default=True,
-                                description="Hide damage panels, destroyed pieces, shadow and propeller spin frames "
-                                            "the game starts hidden")
+                                description="Hide the shadow and propeller spin frames the game starts hidden. "
+                                            "Damage states follow the add-on preferences")
     cockpit: BoolProperty(name="Cockpit Interior", default=False,
                           description="Also import the separate cockpit interior model")
     paint_pattern: EnumProperty(name="Livery", default="fortune", items=_livery_items(),
@@ -111,7 +120,8 @@ class CS_OT_import_pc_models(bpy.types.Operator, ImportHelper, _PcProps):
         cols = None
         if self.custom_colours:
             cols = [tuple(c * 255.0 for c in v) for v in (self.colour1, self.colour2, self.colour3)]
-        opts = pc_import.PcOptions(**_props(self, _PcProps, arrange_spacing=self.arrange_spacing,
+        opts = pc_import.PcOptions(**_props(self, _PcProps, **_shared(pc_import.options_from_prefs),
+                                            arrange_spacing=self.arrange_spacing,
                                             display_state=self.display_state, cockpit=self.cockpit,
                                             paint_pattern=self.paint_pattern, paint_colours=cols,
                                             paint_decals=[int(self.nose_decal), int(self.tail_decal),
@@ -134,7 +144,8 @@ class CS_OT_import_pc_level(bpy.types.Operator, ImportHelper, _PcProps):
 
     def execute(self, context):
         from . import pc_import
-        kw = _props(self, _PcProps, world_only=self.world_only, mission=self.mission)
+        kw = _props(self, _PcProps, world_only=self.world_only, mission=self.mission,
+                    **_shared(pc_import.options_from_prefs))
         pc_import.import_level(self.filepath, pc_import.PcOptions(**kw), _report(self))
         return {"FINISHED"}
 
@@ -142,8 +153,9 @@ class CS_OT_import_pc_level(bpy.types.Operator, ImportHelper, _PcProps):
 # --------------------------------------------------------------------------------------- Xbox
 
 class _XboxProps(_CommonProps):
-    hide_damage: BoolProperty(name="Hide Damage/Debris Variants", default=True,
-                              description="Hide alternative damage-state and debris nodes")
+    hide_helpers: BoolProperty(name="Hide Helper Nodes", default=True,
+                               description="Hide the propeller blur, effect cards and weapon/exhaust markers. "
+                                           "Damage states and collisions follow the add-on preferences")
     normal_maps: BoolProperty(name="Normal Maps", default=True)
     vertex_colors: BoolProperty(name="Vertex Colors", default=True)
 
@@ -176,7 +188,7 @@ class CS_OT_import_xbox(bpy.types.Operator, ImportHelper, _XboxProps):
 
     def execute(self, context):
         from . import xbox_import
-        kw = _props(self, _XboxProps, entry=self.entry, mode=self.mode,
+        kw = _props(self, _XboxProps, **_shared(xbox_import.options_from_prefs), entry=self.entry, mode=self.mode,
                     arrange_spacing=self.arrange_spacing, lightmaps=self.lightmaps, team_skin=self.team_skin)
         xbox_import.import_path(self.filepath, xbox_import.XboxOptions(**kw), _report(self))
         return {"FINISHED"}
@@ -202,16 +214,20 @@ CLASSES = (CS_OT_import_pc_models, CS_OT_import_pc_level, CS_OT_import_xbox, TOP
 
 
 def register():
+    from . import browser, pc_paint, prefs
+    prefs.register()
     for c in CLASSES:
         bpy.utils.register_class(c)
-    from . import pc_paint
+    browser.register()
     pc_paint.register()
     bpy.types.TOPBAR_MT_file_import.append(_menu)
 
 
 def unregister():
+    from . import browser, pc_paint, prefs
     bpy.types.TOPBAR_MT_file_import.remove(_menu)
-    from . import pc_paint
     pc_paint.unregister()
+    browser.unregister()
     for c in reversed(CLASSES):
         bpy.utils.unregister_class(c)
+    prefs.unregister()

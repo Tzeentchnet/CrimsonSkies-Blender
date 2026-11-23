@@ -9,7 +9,7 @@ import time
 
 import bpy
 import numpy as np
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 
 from . import blender_util as bu
 from .formats import pc_anim, pc_gamez, pc_texture
@@ -17,7 +17,12 @@ from .formats import pc_anim, pc_gamez, pc_texture
 
 class PcOptions:
     def __init__(self, **kw):
-        self.lod = kw.get("lod", "HIGHEST")  # HIGHEST | ALL
+        # LODs past the nearest one: off, or into their own hidden collection. The old
+        # lod="ALL" keyword still turns them on.
+        self.import_lods = kw.get("import_lods", kw.get("lod", "HIGHEST") == "ALL")
+        self.import_collisions = kw.get("import_collisions", False)
+        self.damage_states = kw.get("damage_states", "OFF")  # OFF | ON | HIDDEN
+        self.node_indices = kw.get("node_indices")  # import only these nodes (None = roots by root_filter)
         self.hide_inactive = kw.get("hide_inactive", True)
         self.import_normals = kw.get("import_normals", True)
         self.vertex_colors = kw.get("vertex_colors", True)
@@ -37,11 +42,18 @@ class PcOptions:
         self.paint_decals = kw.get("paint_decals")  # (nose, tail, wing), -1 = pattern default
 
 
-# Parts the game starts hidden on an aircraft (docs/formats/gamez.md, "player-plane damage states"
-# and the destruct RESET_STATE): torn damage panels, the damage-detail-off duplicates, the destroyed
-# pieces, the blob shadow and the propeller spin frames (staticprop1 is the parked propeller).
-_HIDDEN_PARTS = re.compile(r"^(pdp\d+|pcdp\d+|destroyed|shadow|player_damage_off|prop\d+b?|prop2\w*|"
-                           r"nitroprop\d*|staticrotor\w*|bullet\d+|piece\d+)$", re.I)
+# Damage states (docs/formats/gamez.md, "player-plane damage states", and destructibles.md): the
+# torn damage panels (pdp*, pcdp* in the cockpit) and their on/off groups, the destroyed pieces,
+# the cockpit bullet holes, and the destroyed variants of world destructibles. The cockpit's
+# damage gauge (damageindicator, nosedamage...) is instrumentation, not damage.
+_DAMAGE = re.compile(r"^(pc?dp\d+\w*|destroyed\w*|player_damage_(on|off)|bullet\d+|partial_damage\w*)$|"
+                     r"destroy|dstry|_damaged?\b|broken|wreck", re.I)
+# Other parts the game starts hidden on an aircraft: the blob shadow and the propeller spin frames
+# (staticprop1 is the parked propeller).
+_HIDDEN_PARTS = re.compile(r"^(shadow|prop\d+b?|prop2\w*|nitroprop\d*|staticrotor\w*|piece\d+)$", re.I)
+# Node flags (docs/formats/gamez.md): polygons tested for collision, or a bounding box instead.
+FLAG_INTERSECT_SURFACE = 0x10
+FLAG_INTERSECT_BBOX = 0x20
 # Invisible helper volumes in the world: fog volumes and Danger Zone paths.
 _HELPERS = re.compile(r"^(fvol\d*|dzpaths?\d*|fogvol\w*)$", re.I)
 _COCKPIT = re.compile(r"^cockpit\d*$", re.I)
@@ -76,9 +88,23 @@ class PcScene:
         self.materials = {}
         self.objects_by_name = {}
         self.node_objects = {}
-        self.stats = {"objects": 0, "meshes": 0}
+        self.stats = {"objects": 0, "meshes": 0, "lods": 0, "damage": 0, "colliders": 0}
         self.root = None
         self.collection = None
+        self.aux = {}
+        self.bbox_nodes = []  # (node object, base collection) of bounding-box colliders
+
+    def aux_collection(self, kind: str, base):
+        """The LODs / Damage / Collision collection next to an import collection."""
+        key = (kind, base.name)
+        col = self.aux.get(key)
+        if col is None:
+            col = bu.new_collection(f"{base.name} {kind}", base)
+            col["cs_role"] = kind
+            if kind == "LODs" or (kind == "Damage" and self.opts.damage_states == "HIDDEN"):
+                bu.set_collection_hidden(col, True)
+            self.aux[key] = col
+        return col
 
     # -- materials -----------------------------------------------------------
     def _image(self, name):
@@ -206,22 +232,36 @@ class PcScene:
         return me
 
     # -- nodes ---------------------------------------------------------------
-    def _skip_lod(self, node):
-        return self.opts.lod == "HIGHEST" and node.kind == "Lod" and (node.lod_range or 0.0) > 0.0
+    @staticmethod
+    def _is_lower_lod(node):
+        return node.kind == "Lod" and (node.lod_range or 0.0) > 0.0
 
-    def build_node(self, index: int, collection, parent, depth=0, visited=None, hidden=False):
+    def build_node(self, index: int, collection, parent, depth=0, visited=None, hidden=False, base=None,
+                   in_damage=False):
         if visited is None:
             visited = set()
         if index in visited or not (0 <= index < len(self.gz.nodes)) or depth > 64:
             return None
         visited.add(index)
         node = self.gz.nodes[index]
+        base = base or collection
         if node.kind in ("Camera", "Window", "Display"):
             return None
-        if self._skip_lod(node):
-            return None
+        if self._is_lower_lod(node):
+            if not self.opts.import_lods:
+                return None
+            collection = self.aux_collection("LODs", base)
+            self.stats["lods"] += 1
         if depth > 0 and not self.opts.cockpit and _COCKPIT.match(node.name or "") and self.opts.display_state:
             return None
+        # a damage root the user picked by itself (node_indices) is imported whatever the setting
+        if (depth > 0 or self.opts.node_indices is None) and not in_damage and _DAMAGE.search(node.name or ""):
+            if self.opts.damage_states == "OFF":
+                return None
+            in_damage, hidden = True, False
+            self.stats["damage"] += 1
+            if self.opts.damage_states == "HIDDEN":
+                collection = self.aux_collection("Damage", base)
         data = self.mesh(node.mesh) if node.mesh >= 0 else None
         if data is None:
             obj = bu.new_empty(node.name or f"node{index}", collection, parent, size=0.25)
@@ -236,10 +276,17 @@ class PcScene:
             obj["cs_lod_range"] = node.lod_range
         if node.kind == "Light":
             obj.empty_display_type = "SPHERE"
-        if self.opts.hide_inactive and not node.active and depth > 0:
+        if in_damage:
+            obj["cs_damage_state"] = True
+        elif self.opts.hide_inactive and not node.active and depth > 0:
             hidden = True
-        if self.opts.display_state and depth > 0 and _HIDDEN_PARTS.match(node.name or ""):
+        if self.opts.display_state and depth > 0 and not in_damage and _HIDDEN_PARTS.match(node.name or ""):
             hidden = True
+        if self.opts.import_collisions:
+            obj["cs_collision"] = ("bbox" if node.flags & FLAG_INTERSECT_BBOX else
+                                   "surface" if node.flags & FLAG_INTERSECT_SURFACE else "none")
+            if node.flags & FLAG_INTERSECT_BBOX:
+                self.bbox_nodes.append((obj, base))
         if hidden:
             bu.hide(obj, True)  # Blender does not hide children with their parent
         if _HELPERS.match(node.name or "") or (parent is not None and parent.get("cs_helper")):
@@ -259,8 +306,29 @@ class PcScene:
                 if L.blink_period:
                     lo["cs_blink_period"] = L.blink_period
         for c in node.children:
-            self.build_node(c, collection, obj, depth + 1, visited, hidden)
+            self.build_node(c, collection, obj, depth + 1, visited, hidden, base, in_damage)
         return obj
+
+    def build_colliders(self):
+        """A wireframe box over each bounding-box collider node's meshes, in the Collision
+        collection. Every other solid node collides with its own polygons (cs_collision)."""
+        if not self.bbox_nodes:
+            return
+        bpy.context.view_layer.update()
+        for obj, base in self.bbox_nodes:
+            inv = obj.matrix_world.inverted()
+            pts = []
+            for o in [obj] + list(obj.children_recursive):
+                if o.type == "MESH":
+                    m = inv @ o.matrix_world
+                    pts.extend(m @ Vector(c) for c in o.bound_box)
+            if not pts:
+                continue
+            lo = [min(p[i] for p in pts) for i in range(3)]
+            hi = [max(p[i] for p in pts) for i in range(3)]
+            box = bu.box_object(f"{obj.name}_bbox", lo, hi, self.aux_collection("Collision", base), obj)
+            box["cs_collision"] = "bbox"
+            self.stats["colliders"] += 1
 
 
 def _texture_library(install: str, chapter: str | None, extra=()):
@@ -286,6 +354,25 @@ def _matches(name: str, filt: str) -> bool:
     return any(fnmatch.fnmatch(n, p) or p == n for p in pats)
 
 
+def options_from_prefs(p) -> dict:
+    """PcOptions keywords from the add-on preferences."""
+    return dict(import_lods=p.import_lods, import_collisions=p.import_collisions, damage_states=p.damage_states,
+                animations=p.animations, pack_images=p.pack_images, paint_pattern=p.pc_livery)
+
+
+def _wanted_roots(gz, opts: PcOptions):
+    if opts.node_indices is not None:
+        idx = set(opts.node_indices)
+        return [n for n in gz.nodes if n.index in idx]
+    return [n for n in gz.roots() if _matches(n.name, opts.root_filter)]
+
+
+def _summary(scene: PcScene):
+    s = scene.stats
+    extra = [f"{s[k]} {k}" for k in ("lods", "damage", "colliders") if s[k]]
+    return (", " + ", ".join(extra)) if extra else ""
+
+
 def import_planes(path: str, opts: PcOptions, report=print):
     """planes.zbd (or any gamez-format archive treated as a model library)."""
     t0 = time.time()
@@ -299,7 +386,7 @@ def import_planes(path: str, opts: PcOptions, report=print):
     root.matrix_world = bu.Y_UP_TO_Z_UP
     scene = PcScene(gz, lib, opts, label)
     scene.root, scene.collection = root, col
-    roots = [n for n in gz.roots() if n.kind not in ("Camera", "Window", "Display") and _matches(n.name, opts.root_filter)]
+    roots = [n for n in _wanted_roots(gz, opts) if n.kind not in ("Camera", "Window", "Display")]
     per_row = max(1, int(len(roots) ** 0.5 + 0.999))
     for i, n in enumerate(roots):
         sub = bu.new_collection(n.name, col)
@@ -309,40 +396,56 @@ def import_planes(path: str, opts: PcOptions, report=print):
             obj.location = (obj.location[0] + (i % per_row) * opts.arrange_spacing,
                             obj.location[1],
                             obj.location[2] + (i // per_row) * opts.arrange_spacing)
+    scene.build_colliders()
     painted = 0
+    aircraft = []
     if install:
         from . import pc_paint
         for obj in list(root.children):
             try:
-                if pc_paint.tag_aircraft(obj, install) and opts.paint_pattern != "shipped":
-                    pc_paint.paint_aircraft(obj, opts.paint_pattern, opts.paint_colours, opts.paint_decals, report)
-                    painted += 1
+                if pc_paint.tag_aircraft(obj, install):
+                    aircraft.append(obj)
+                    if opts.paint_pattern != "shipped":
+                        pc_paint.paint_aircraft(obj, opts.paint_pattern, opts.paint_colours, opts.paint_decals,
+                                                report)
+                        painted += 1
             except FileNotFoundError as exc:
                 report(f"  liveries unavailable: {exc}")
                 break
+        if aircraft:
+            # select the aircraft so the sidebar's livery panel lists the first one's liveries
+            pc_paint.focus_aircraft(aircraft)
     if opts.animations and install:
         _apply_animations(scene, install, None, opts, report)
     report(f"Crimson Skies PC: {label}: {painted} painted, {len(roots)} models, {scene.stats['objects']} objects, "
-           f"{scene.stats['meshes']} meshes, {len(scene.images.images)} textures in {time.time() - t0:.1f}s")
+           f"{scene.stats['meshes']} meshes{_summary(scene)}, {len(scene.images.images)} textures "
+           f"in {time.time() - t0:.1f}s")
     return col
 
 
-def import_level(path: str, opts: PcOptions, report=print):
-    """A chapter's gamez.zbd: the world, its textures and (optionally) its animations."""
+def import_level(path: str, opts: PcOptions, report=print, label=None):
+    """A chapter's gamez.zbd: the world, its textures and (optionally) its animations. With
+    opts.node_indices, only those root objects (label names the collection)."""
     t0 = time.time()
     install = find_install(path)
     chapter = os.path.basename(os.path.dirname(os.path.abspath(path)))
     with open(path, "rb") as f:
         gz = pc_gamez.read(f.read())
     lib = _texture_library(install, chapter) if install else pc_texture.TextureLibrary()
-    col = bu.new_collection(f"CS_PC_{chapter}")
-    root = bu.new_empty(f"{chapter}_root", col, None, size=10.0, display="ARROWS")
+    if opts.node_indices is not None:
+        name = f"{chapter}_{label}" if label else f"{chapter}_objects"
+    else:
+        name = f"{chapter}_{opts.mission}" if opts.mission else chapter
+    col = bu.new_collection(f"CS_PC_{name}")
+    root = bu.new_empty(f"{name}_root", col, None, size=10.0, display="ARROWS")
     root.matrix_world = bu.Y_UP_TO_Z_UP
     scene = PcScene(gz, lib, opts, chapter)
     scene.root, scene.collection = root, col
     roots = gz.roots()
     wanted = []
-    if opts.world_only:
+    if opts.node_indices is not None:
+        wanted = [n.index for n in _wanted_roots(gz, opts)]
+    elif opts.world_only:
         worlds = [n for n in gz.nodes if n.kind == "World"]
         seen = set()
         for w in worlds:
@@ -352,16 +455,20 @@ def import_level(path: str, opts: PcOptions, report=print):
                     wanted.append(idx)
     else:
         wanted = [n.index for n in roots]
-    wanted = [i for i in wanted if _matches(gz.nodes[i].name, opts.root_filter)]
+    if opts.node_indices is None:
+        wanted = [i for i in wanted if _matches(gz.nodes[i].name, opts.root_filter)]
     visited = set()
+    # objects picked out of a chapter keep their world placement, so a few far-apart ones are
+    # still where the level puts them
     for idx in wanted:
         if idx in visited:
             continue
         scene.build_node(idx, col, root, 0, visited)
+    scene.build_colliders()
     if opts.animations and install:
         _apply_animations(scene, install, chapter, opts, report)
-    report(f"Crimson Skies PC: {chapter}: {scene.stats['objects']} objects, {scene.stats['meshes']} meshes, "
-           f"{len(scene.images.images)} textures in {time.time() - t0:.1f}s")
+    report(f"Crimson Skies PC: {name}: {scene.stats['objects']} objects, {scene.stats['meshes']} meshes"
+           f"{_summary(scene)}, {len(scene.images.images)} textures in {time.time() - t0:.1f}s")
     return col
 
 
@@ -415,7 +522,7 @@ def _apply_animations(scene: PcScene, install, chapter, opts: PcOptions, report)
                 continue
             targets = scene.objects_by_name.get(script.object_name)
             if (not targets and chapter and script.object_name.lower().startswith("camera")
-                    and scene.root is not None):
+                    and scene.root is not None and opts.node_indices is None):
                 # cutscene camera scripts: one animated Blender camera per script
                 cam = bpy.data.cameras.new(script.name)
                 cam.lens_unit = "FOV"

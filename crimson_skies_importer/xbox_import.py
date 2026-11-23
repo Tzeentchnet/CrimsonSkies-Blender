@@ -20,7 +20,20 @@ from .formats import xbox_anim, xbox_model, xbox_package, xbox_texture
 C3 = np.array([[1, 0, 0], [0, 0, 1], [0, 1, 0]], dtype=np.float64)
 C4 = Matrix(((1, 0, 0, 0), (0, 0, 1, 0), (0, 1, 0, 0), (0, 0, 0, 1)))
 
-_HIDE = re.compile(r"(_dmg[1-9]\d*$|^prop_fast|^fx|^hidden$|^boundbox$|_debris|^debris)", re.I)
+# Helper nodes the game never draws as they are: the fast-propeller blur, effect emitter cards and
+# the "hidden" group of weapon, exhaust and contrail markers.
+_HIDE = re.compile(r"(^prop_fast|^fx|^hidden$)", re.I)
+# Collision volumes: the collide_N cards of aircraft and the boundbox of props.
+_COLLISION = re.compile(r"^(collide_?\d*|boundbox)$", re.I)
+# Damage-state subtrees (<model>_dmg1.._dmgN; _dmg0 is the healthy state) and debris pieces.
+_DAMAGE_NODE = re.compile(r"(_dmg[1-9]\d*$|debris|holedmg|engine_dmg|^collapse$)", re.I)
+# Whole models that are damage states: debris sets, the falling fuselage of a downed aircraft,
+# collapse and damaged-variant models.
+_DAMAGE_MODEL = re.compile(r"(debris|_dmg\d|_fusalage|collapse|collaspe)", re.I)
+
+
+def is_damage_model(name: str) -> bool:
+    return bool(_DAMAGE_MODEL.search(name or ""))
 
 
 class XboxOptions:
@@ -29,7 +42,9 @@ class XboxOptions:
         self.mode = kw.get("mode", "AUTO")
         self.arrange_spacing = kw.get("arrange_spacing", 30.0)
         self.lightmaps = kw.get("lightmaps", True)
-        self.hide_damage = kw.get("hide_damage", True)
+        self.hide_helpers = kw.get("hide_helpers", kw.get("hide_damage", True))
+        self.import_collisions = kw.get("import_collisions", False)
+        self.damage_states = kw.get("damage_states", "OFF")  # OFF | ON | HIDDEN
         self.normal_maps = kw.get("normal_maps", True)
         self.vertex_colors = kw.get("vertex_colors", True)
         self.animations = kw.get("animations", True)
@@ -59,7 +74,24 @@ class Context:
         self.alpha_info = {}
         self.lightmap = None
         self.grid_index = 0
-        self.stats = {"objects": 0, "meshes": 0}
+        self.stats = {"objects": 0, "meshes": 0, "damage": 0, "colliders": 0}
+        self.aux = {}
+
+    def aux_collection(self, kind: str, base):
+        """The Damage / Collision collection next to an import collection."""
+        key = (kind, base.name)
+        col = self.aux.get(key)
+        if col is None:
+            col = bu.new_collection(f"{base.name} {kind}", base)
+            col["cs_role"] = kind
+            if kind == "Damage" and self.opts.damage_states == "HIDDEN":
+                bu.set_collection_hidden(col, True)
+            self.aux[key] = col
+        return col
+
+    def summary(self):
+        extra = [f"{self.stats[k]} {k}" for k in ("damage", "colliders") if self.stats[k]]
+        return (", " + ", ".join(extra)) if extra else ""
 
     def add_package(self, pkg):
         for k, e in pkg.textures().items():
@@ -176,26 +208,55 @@ def build_mesh_data(name, meshes, ctx: Context, lightmapped: bool):
     return me
 
 
+def _classify(name: str, opts: XboxOptions, in_damage: bool):
+    """'collision', 'damage', 'skip' (filtered out by the options) or None for a plain node."""
+    if _COLLISION.match(name):
+        return "collision" if opts.import_collisions else "skip"
+    if not in_damage and _DAMAGE_NODE.search(name):
+        return "damage" if opts.damage_states != "OFF" else "skip"
+    return None
+
+
 def build_model(model: xbox_model.XModel, ctx: Context, collection, parent=None, label=None,
-                lightmapped=False):
-    """Objects for a model's node tree; returns (root object, {node name: object}, node objects)."""
+                lightmapped=False, in_damage=False):
+    """Objects for a model's node tree; returns (root object, {node name: object}, node objects).
+    in_damage: the whole model is a damage state (a debris or wreck model), so nothing in it is
+    filtered or moved as damage."""
     objs = {}
     by_index = {}
     skinned = model.version == 2
+    base = collection
 
-    def make(node, parent_obj, depth, hidden=False):
+    def make(node, parent_obj, depth, hidden=False, coll=collection, damage=in_damage):
         name = node.name or f"node{node.index}"
+        role = _classify(name, ctx.opts, damage) if depth > 0 and not skinned else None
+        if role == "skip":
+            return None
+        if role == "collision":
+            coll, hidden = ctx.aux_collection("Collision", base), False
+        elif role == "damage":
+            damage, hidden = True, False
+            ctx.stats["damage"] += 1
+            if ctx.opts.damage_states == "HIDDEN":
+                coll = ctx.aux_collection("Damage", base)
         data = None
         if node.meshes and not skinned:
             data = build_mesh_data(f"{label or model.name}:{name}", node.meshes, ctx, lightmapped)
         if data is None:
-            obj = bu.new_empty(name, collection, parent_obj, size=0.3)
+            obj = bu.new_empty(name, coll, parent_obj, size=0.3)
         else:
-            obj = bu.new_object(name, data, collection, parent_obj)
+            obj = bu.new_object(name, data, coll, parent_obj)
         obj.matrix_basis = d3d_matrix(node.matrix)
         obj["cs_kind"] = node.kind
         obj["cs_node_index"] = node.index
-        if ctx.opts.hide_damage and depth > 0 and _HIDE.search(name):
+        if role == "collision":
+            obj["cs_collision"] = True
+            obj.display_type = "WIRE"
+            obj.hide_render = True
+            ctx.stats["colliders"] += 1
+        elif damage:
+            obj["cs_damage_state"] = True
+        if ctx.opts.hide_helpers and depth > 0 and role != "collision" and _HIDE.search(name):
             hidden = True
         if hidden:
             bu.hide(obj, True)
@@ -203,7 +264,7 @@ def build_model(model: xbox_model.XModel, ctx: Context, collection, parent=None,
         objs.setdefault(name, obj)
         by_index[node.index] = obj
         for c in node.children:
-            make(c, obj, depth + 1, hidden)
+            make(c, obj, depth + 1, hidden, coll, damage)
         return obj
 
     root = make(model.root, parent, 0)
@@ -211,11 +272,11 @@ def build_model(model: xbox_model.XModel, ctx: Context, collection, parent=None,
         root.name = label
     root["cs_model"] = model.name
     if skinned:
-        _build_skin(model, ctx, collection, root, by_index, label or model.name)
+        _build_skin(model, ctx, collection, root, by_index, label or model.name, in_damage)
     return root, objs, by_index
 
 
-def _build_skin(model, ctx, collection, root, by_index, label):
+def _build_skin(model, ctx, collection, root, by_index, label, in_damage=False):
     """Armature over every node, skinned meshes deformed by it."""
     bpy.context.view_layer.update()
     arm_data = bpy.data.armatures.new(f"{label}_armature")
@@ -247,9 +308,20 @@ def _build_skin(model, ctx, collection, root, by_index, label):
     for n in model.nodes:
         if not n.meshes:
             continue
+        role = _classify(n.name or "", ctx.opts, in_damage)
+        if role == "skip":
+            continue
+        coll = collection
+        if role == "collision":
+            coll = ctx.aux_collection("Collision", collection)
+        elif role == "damage" and ctx.opts.damage_states == "HIDDEN":
+            coll = ctx.aux_collection("Damage", collection)
         me = build_mesh_data(f"{label}:{n.name}", n.meshes, ctx, False)
-        obj = bu.new_object(f"{n.name}_skin", me, collection, arm)
-        if ctx.opts.hide_damage and _HIDE.search(n.name or ""):
+        obj = bu.new_object(f"{n.name}_skin", me, coll, arm)
+        if role == "collision":
+            obj.display_type = "WIRE"
+            obj.hide_render = True
+        elif ctx.opts.hide_helpers and _HIDE.search(n.name or ""):
             bu.hide(obj, True)
         offset = 0
         for m in n.meshes:
@@ -355,6 +427,55 @@ def _filter(entries, pattern):
                                       or e.base_name.lower() == p or e.base_name.lower() == p + ".x" for p in pats)]
 
 
+_ROOT_NODE = "Model_Root"
+# Maya's default names (pCube7, pCylinder18, polySurface3, group2, result1): most models have
+# some, so they say nothing about which model an animation was made for.
+_GENERIC_NODE = re.compile(r"^(p(cube|cylinder|sphere|plane|cone|torus|pipe)|polysurface|group|transform|"
+                           r"result|curve|locator|null)_?\d*$", re.I)
+
+
+def _level_anim_units(anim, units):
+    """The {target: object} maps a level animation is keyed onto, one per unit it belongs to.
+
+    units: {instance: (objs, node names)}: the built objects by node name, and the names of every
+    node of the unit's model, the ones the import filtered out included.
+    Levels carry every animation the mission may play, the player weapons' (Plane_Detonator:
+    pCube1, body...) included, and models share node names, so one shared name is no evidence.
+    The animation goes to the units with the most of its distinctive targets (neither Maya
+    default names nor the animation's own group node), at least two of them or all there are
+    (several instances of one model tie and all take it); an animation without distinctive
+    targets goes to the units that have all of its targets. A Model_Root track is a world
+    placement (Beacon_Falling, Talon_Falling), so it goes only to the unit placed where the
+    track starts."""
+    stem = os.path.splitext(anim.name or "")[0].lower()
+    names = {t.target for t in anim.tracks if t.target != _ROOT_NODE and t.target.lower() != stem}
+    distinct = {n for n in names if not _GENERIC_NODE.match(n)}
+    if distinct:
+        score = {k: len(distinct & nn) for k, (_o, nn) in units.items()}
+        need = max(min(2, len(distinct)), max(score.values(), default=0))
+        chosen = [k for k, s in score.items() if s >= need]
+    else:
+        chosen = [k for k, (_o, nn) in units.items() if len(names) > 1 and names <= nn]
+    out = []
+    for k in chosen:
+        objs = units[k][0]
+        hit = names & objs.keys()
+        if hit:
+            out.append({n: objs[n] for n in hit})
+    for t in anim.tracks:
+        if t.target != _ROOT_NODE or not len(t.pos):
+            continue
+        start = Vector(C3 @ t.pos[0].astype(np.float64))
+        best, dist = None, 0.5
+        for objs, _names in units.values():
+            root = objs.get(_ROOT_NODE)
+            if root is not None and (root.matrix_basis.translation - start).length < dist:
+                best, dist = root, (root.matrix_basis.translation - start).length
+        if best is not None:
+            out.append({_ROOT_NODE: best})
+    return out
+
+
 def import_level(pkg, ctx: Context, parent_col, report):
     t0 = time.time()
     label = os.path.splitext(os.path.basename(pkg.name))[0]
@@ -370,15 +491,21 @@ def import_level(pkg, ctx: Context, parent_col, report):
     n_units = 0
     objs_by_model = {}
     for e in _models_in(pkg, True):
+        damage_model = is_damage_model(e.base_name)
+        if damage_model and ctx.opts.damage_states == "OFF":
+            continue
         try:
             model = xbox_model.read(e.data(), e.name)
         except Exception as exc:
             report(f"  {e.name}: {exc}")
             continue
-        r, objs, _ = build_model(model, ctx, units_col, root, label=e.instance_name,
-                                 lightmapped=bool(model.flags & 0x100))
+        target = units_col
+        if damage_model and ctx.opts.damage_states == "HIDDEN":
+            target = ctx.aux_collection("Damage", units_col)
+        r, objs, _ = build_model(model, ctx, target, root, label=e.instance_name,
+                                 lightmapped=bool(model.flags & 0x100), in_damage=damage_model)
         r["cs_model"] = e.base_name
-        objs_by_model[e.instance_name] = objs
+        objs_by_model[e.instance_name] = (objs, {n.name for n in model.nodes})
         n_units += 1
     # terrain and water chunks of the world section (world-space vertices)
     world_col = bu.new_collection(f"{label}_world", col)
@@ -398,7 +525,7 @@ def import_level(pkg, ctx: Context, parent_col, report):
     props = pkg.world_props()
     if props:
         col["cs_scatter_props"] = ", ".join(props)
-    # level animations (doors, turrets...) onto the units that have the targets
+    # level animations (doors, turrets, falling buildings...) onto the units they belong to
     n_anim = 0
     if ctx.opts.animations:
         for e in pkg.of_type(xbox_package.TYPE_ANIM):
@@ -406,13 +533,12 @@ def import_level(pkg, ctx: Context, parent_col, report):
                 anim = xbox_anim.read(e.data())
             except Exception:
                 continue
-            targets = {t.target for t in anim.tracks}
-            for inst, objs in objs_by_model.items():
-                if targets & set(objs):
-                    n_anim += apply_animation(anim, objs, ctx.opts)
+            for objs in _level_anim_units(anim, objs_by_model):
+                n_anim += apply_animation(anim, objs, ctx.opts)
     ctx.lightmap = None
     report(f"Crimson Skies Xbox level {label}: {n_units} units, {n_chunks} terrain/water chunks, "
-           f"{n_anim} animation tracks, {len(ctx.images.images)} textures in {time.time() - t0:.1f}s")
+           f"{n_anim} animation tracks{ctx.summary()}, {len(ctx.images.images)} textures "
+           f"in {time.time() - t0:.1f}s")
     return col
 
 
@@ -420,19 +546,28 @@ def import_models(pkg, ctx: Context, parent_col, report, pattern="", with_anims=
     t0 = time.time()
     label = os.path.splitext(os.path.basename(pkg.name))[0]
     col = bu.new_collection(f"CS_Xbox_{label}", parent_col)
-    entries = _filter(_models_in(pkg, False), pattern if pattern and not pattern.lower().endswith(".bin") else "")
+    if pattern and pattern.lower().endswith(".bin"):
+        pattern = ""
+    entries = _filter(_models_in(pkg, False), pattern)
     if not entries:
-        entries = _filter(_models_in(pkg, True), pattern if not pattern.lower().endswith(".bin") else "")
+        entries = _filter(_models_in(pkg, True), pattern)
     built = []
     for e in entries:
+        # a damage model named in the pattern is imported whatever the damage setting
+        damage_model = is_damage_model(e.base_name)
+        if damage_model and ctx.opts.damage_states == "OFF" and not pattern:
+            continue
         try:
             model = xbox_model.read(e.data(), e.name)
         except Exception as exc:
             report(f"  {e.name}: {exc}")
             continue
         sub = bu.new_collection(os.path.splitext(e.base_name)[0], col)
+        if damage_model and ctx.opts.damage_states == "HIDDEN" and not pattern:
+            sub["cs_role"] = "Damage"
+            bu.set_collection_hidden(sub, True)
         holder = bu.new_empty(os.path.splitext(e.base_name)[0], sub, None, size=1.0, display="ARROWS")
-        r, objs, _ = build_model(model, ctx, sub, holder, lightmapped=False)
+        r, objs, _ = build_model(model, ctx, sub, holder, lightmapped=False, in_damage=damage_model)
         if "|" in e.name:
             r.matrix_basis = Matrix.Identity(4)
         built.append((e, model, holder, objs))
@@ -466,8 +601,15 @@ def import_models(pkg, ctx: Context, parent_col, report, pattern="", with_anims=
             longest = max((a.frame_count for a in anims), default=0)
             bu.set_scene_range(longest + 1, ctx.opts.fps)
     report(f"Crimson Skies Xbox {label}: {len(built)} models, {ctx.stats['objects']} objects, "
-           f"{n_anim} animation tracks, {len(ctx.images.images)} textures in {time.time() - t0:.1f}s")
+           f"{n_anim} animation tracks{ctx.summary()}, {len(ctx.images.images)} textures "
+           f"in {time.time() - t0:.1f}s")
     return col
+
+
+def options_from_prefs(p) -> dict:
+    """XboxOptions keywords from the add-on preferences (the Xbox game ships no LODs)."""
+    return dict(import_collisions=p.import_collisions, damage_states=p.damage_states, animations=p.animations,
+                pack_images=p.pack_images, team_skin=p.team_skin)
 
 
 def import_path(path: str, opts: XboxOptions, report=print):

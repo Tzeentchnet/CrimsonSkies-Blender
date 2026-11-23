@@ -41,6 +41,42 @@ def hide(obj, hidden=True):
     obj.hide_render = hidden
 
 
+def _layer_collection(layer_col, col):
+    if layer_col.collection == col:
+        return layer_col
+    for child in layer_col.children:
+        found = _layer_collection(child, col)
+        if found is not None:
+            return found
+    return None
+
+
+def set_collection_hidden(col, hidden=True):
+    """Turns a collection's visibility (the outliner eye, in every view layer) off or on, and
+    keeps it out of renders while hidden."""
+    for vl in bpy.context.scene.view_layers:
+        lc = _layer_collection(vl.layer_collection, col)
+        if lc is not None:
+            lc.hide_viewport = hidden
+    col.hide_render = hidden
+
+
+def box_object(name: str, lo, hi, collection, parent=None):
+    """A wireframe box mesh from lo to hi in the parent's space (a collision volume)."""
+    (x0, y0, z0), (x1, y1, z1) = lo, hi
+    verts = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+             (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)]
+    faces = [(0, 3, 2, 1), (4, 5, 6, 7), (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts, [], faces)
+    me.update()
+    obj = new_object(name, me, collection, parent)
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    obj.display_type = "WIRE"
+    obj.hide_render = True
+    return obj
+
+
 # --------------------------------------------------------------------------- images
 
 class ImageCache:

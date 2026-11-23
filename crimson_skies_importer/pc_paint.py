@@ -225,6 +225,79 @@ def _on_pattern(self, context):
         self.colour1, self.colour2, self.colour3 = [tuple(v / 255.0 for v in c) for c in cols]
 
 
+def sync_settings(scene, root):
+    """Loads an aircraft's current livery (pattern, colours, decals) into the sidebar settings,
+    so the panel opens on what the aircraft wears. The aircraft (or one of its parts) must be the
+    active object: the pattern list is built from it."""
+    s = scene.cs_paint
+    pattern = root.get("cs_paint_pattern") or "shipped"
+    offered = (root.get("cs_patterns") or "").split(",")
+    try:
+        s.pattern = pattern if pattern == "shipped" or pattern in offered or not offered[0] else "shipped"
+    except TypeError:
+        pass
+    cols = list(root.get("cs_paint_colours") or [])
+    if len(cols) == 9:
+        mine = [tuple(cols[i:i + 3]) for i in (0, 3, 6)]
+        s.colour1, s.colour2, s.colour3 = [tuple(v / 255.0 for v in c) for c in mine]
+        defaults = [tuple(c) for c in pc_rof.PATTERN_COLOURS.get(pattern, ())]
+        s.custom_colours = bool(defaults) and mine != defaults
+    else:
+        s.custom_colours = False
+    decals = list(root.get("cs_paint_decals") or [])
+    default_decals = list(pc_rof.PATTERN_DECALS.get(pattern, ()))
+    for i, key in enumerate(("nose", "tail", "wing")):
+        d = decals[i] if i < len(decals) else -1
+        if default_decals and d == default_decals[i]:
+            d = -1
+        setattr(s, key, str(d))
+    s.synced = root.name
+
+
+def focus_aircraft(roots):
+    """Selects imported aircraft, makes the first active and loads its livery into the sidebar."""
+    vl = bpy.context.view_layer
+    vl.update()  # new objects reach the view layer's bases lazily
+    for o in vl.objects:
+        if o.select_get():
+            o.select_set(False)
+    shown = []
+    for r in roots:
+        try:
+            r.select_set(True, view_layer=vl)
+            shown.append(r)
+        except RuntimeError:  # not in this view layer (an excluded collection)
+            pass
+    if shown:
+        vl.objects.active = shown[0]
+        sync_settings(bpy.context.scene, shown[0])
+
+
+_msgbus_owner = object()
+
+
+def _on_active_changed():
+    ctx = bpy.context
+    obj = getattr(ctx, "active_object", None)
+    scene = getattr(ctx, "scene", None)
+    if obj is None or scene is None or not hasattr(scene, "cs_paint"):
+        return
+    root = aircraft_root(obj)
+    if root is not None and scene.cs_paint.synced != root.name:
+        sync_settings(scene, root)
+
+
+def subscribe():
+    bpy.msgbus.clear_by_owner(_msgbus_owner)
+    bpy.msgbus.subscribe_rna(key=(bpy.types.LayerObjects, "active"), owner=_msgbus_owner, args=(),
+                             notify=_on_active_changed)
+
+
+@bpy.app.handlers.persistent
+def _on_load_post(*_args):
+    subscribe()  # message-bus subscriptions do not survive loading a file
+
+
 class CS_PaintSettings(bpy.types.PropertyGroup):
     pattern: bpy.props.EnumProperty(name="Livery", items=_pattern_items, update=_on_pattern)
     custom_colours: bpy.props.BoolProperty(name="Custom Colours", default=False)
@@ -237,6 +310,8 @@ class CS_PaintSettings(bpy.types.PropertyGroup):
     nose: bpy.props.EnumProperty(name="Nose", items=_DECAL_ITEMS, default="-1")
     tail: bpy.props.EnumProperty(name="Tail", items=_DECAL_ITEMS, default="-1")
     wing: bpy.props.EnumProperty(name="Wing", items=_DECAL_ITEMS, default="-1")
+    synced: bpy.props.StringProperty(options={"HIDDEN"},
+                                     description="The aircraft whose livery these settings were loaded from")
 
 
 class CS_OT_apply_paint(bpy.types.Operator):
@@ -264,7 +339,23 @@ class CS_OT_apply_paint(bpy.types.Operator):
             except (RuntimeError, FileNotFoundError) as exc:
                 self.report({"ERROR"}, str(exc))
                 return {"CANCELLED"}
+        s.synced = aircraft_root(context.active_object).name if context.active_object else ""
         self.report({"INFO"}, f"Painted {len(roots)} aircraft ({n} textures)")
+        return {"FINISHED"}
+
+
+class CS_OT_load_paint(bpy.types.Operator):
+    """Load the active aircraft's current livery into these settings"""
+    bl_idname = "crimson_skies.load_paint"
+    bl_label = "Load Aircraft's Livery"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and aircraft_root(context.active_object) is not None
+
+    def execute(self, context):
+        sync_settings(context.scene, aircraft_root(context.active_object))
         return {"FINISHED"}
 
 
@@ -273,6 +364,7 @@ class CS_PT_paint(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Crimson Skies"
+    bl_order = 1
 
     def draw(self, context):
         lay = self.layout
@@ -280,11 +372,16 @@ class CS_PT_paint(bpy.types.Panel):
         if root is None:
             lay.label(text="Select an imported PC aircraft")
             return
-        lay.label(text=f"{root.name}: {pc_rof.AIRCRAFT.get(root['cs_skin_prefix'], '')}")
-        if root.get("cs_paint_pattern"):
-            lay.label(text=f"Current: {pc_rof.PATTERN_LABELS.get(root['cs_paint_pattern'], '')}")
+        lay.label(text=f"{root.name}: {pc_rof.AIRCRAFT.get(root['cs_skin_prefix'], '')}", icon="AUTO")
+        current = root.get("cs_paint_pattern")
+        lay.label(text=f"Wearing: {pc_rof.PATTERN_LABELS.get(current, '') if current else 'Shipped (unpainted)'}")
         s = context.scene.cs_paint
-        lay.prop(s, "pattern")
+        if s.synced != root.name:
+            lay.operator(CS_OT_load_paint.bl_idname, icon="IMPORT")
+        offered = [p for p in (root.get("cs_patterns") or "").split(",") if p]
+        box = lay.box()
+        box.label(text=f"Liveries ({len(offered)})" if offered else "Liveries (crimson.rof not found)")
+        box.column(align=True).prop(s, "pattern", expand=True)
         lay.prop(s, "custom_colours")
         col = lay.column()
         col.enabled = s.custom_colours
@@ -299,16 +396,21 @@ class CS_PT_paint(bpy.types.Panel):
         lay.operator(CS_OT_apply_paint.bl_idname, icon="BRUSH_DATA")
 
 
-CLASSES = (CS_PaintSettings, CS_OT_apply_paint, CS_PT_paint)
+CLASSES = (CS_PaintSettings, CS_OT_apply_paint, CS_OT_load_paint, CS_PT_paint)
 
 
 def register():
     for c in CLASSES:
         bpy.utils.register_class(c)
     bpy.types.Scene.cs_paint = bpy.props.PointerProperty(type=CS_PaintSettings)
+    subscribe()
+    bpy.app.handlers.load_post.append(_on_load_post)
 
 
 def unregister():
+    if _on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load_post)
+    bpy.msgbus.clear_by_owner(_msgbus_owner)
     del bpy.types.Scene.cs_paint
     for c in reversed(CLASSES):
         bpy.utils.unregister_class(c)
