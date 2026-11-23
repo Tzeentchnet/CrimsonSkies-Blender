@@ -9,9 +9,16 @@ from both games:
 
 No game data is included. You need your own copies of the games.
 
+| PC aircraft, painted at import | PC chapter world |
+|---|---|
+| ![PC aircraft with its livery painted at import](docs/images/pc_import.png) | ![PC chapter world: terrain, river, airfield, hangars, zeppelin and clouds](docs/images/pc_levelimport.png) |
+| **Xbox aircraft** | **Xbox level** |
+| ![Xbox aircraft model with its textures](docs/images/xbox_import.png) | ![Xbox level: lightmapped terrain and placed canyon units](docs/images/xbox_levelimport.png) |
+
 ## Install
 
-1. Build the zip (or use `dist/crimson_skies_importer-1.2.0.zip`):
+1. Download the zip from the [latest release](https://github.com/Tzeentchnet/CrimsonSkies-Blender/releases/latest)
+   (it is also in `dist/`), or build it:
    `blender --command extension build --source-dir crimson_skies_importer --output-dir dist`
 2. In Blender, go to *Edit > Preferences > Get Extensions*, open the drop-down at the top right,
    choose *Install from Disk…* and pick the zip.
@@ -20,6 +27,8 @@ There are two ways in: the **asset browser** in the 3D view's sidebar (*N > Crim
 **File > Import > Crimson Skies**.
 
 ## Asset browser
+
+<img src="docs/images/ui_pc.png" alt="The Crimson Skies Browser in the 3D view sidebar, scanned PC install" width="300" align="right">
 
 1. Choose **PC** or **Xbox** at the top of the panel, then set the source. For PC, that's the
    Crimson Skies install folder (the one holding `ZBD` and `GOSDATA`). For Xbox, it's the
@@ -37,6 +46,8 @@ There are two ways in: the **asset browser** in the 3D view's sidebar (*N > Crim
 | Xbox | Levels, Multiplayer Levels, Player / AI / Ambient Aircraft, Other Packages (whole packages); Props, Vehicles, Zeppelins, Turrets & Defenses, Characters, Bosses, Pickups & Targets, Skies, Effects, Aircraft Models, Debris & Damage (each distinct model of the level packages) |
 
 A level object imported on its own keeps its world position.
+
+<br clear="right">
 
 ### Preferences
 
@@ -85,6 +96,10 @@ Options:
 
 The skins in `texture.zbd` are unpainted key textures; the game paints each aircraft at load time.
 The importer does the same from `GOSDATA\ASSETS\crimson.rof` (with `crimptch.rof` applied):
+
+| Painted at import | Repainted in the Sacred Trust livery |
+|---|---|
+| ![PC aircraft painted at import](docs/images/pc_import.png) | ![The same aircraft repainted with the Sacred Trust pattern and decals](docs/images/pc_import_livery%20selection.png) |
 
 - **Livery** (import option): one of the 14 patterns (Fortune Hunters, Black Hats, Blake's
   Bandits, British, Black Swans, Red Army, Hollywood Knights, Hughes, Medusas, Sacred Trust,
@@ -147,6 +162,11 @@ What is imported:
 - **Animations** (`.anm`): keyed onto objects, or onto pose bones for skinned models, at 30 fps.
 - **Levels**: each lightmapped unit instance (`model.x|UnitName`) carries its own placement. The
   terrain and water chunks come from the world section. Lightmaps are multiplied in at 2x on `UV3`.
+  A level package carries every animation its mission may play, so each one is keyed only onto
+  the units it was made for: the ones holding most of its distinctive node names (Maya default
+  names such as `pCube1` don't count). A `Model_Root` track is a world placement and goes to the
+  unit placed where it starts (Final_Boss's `Beacon_Falling` and `Talon_Falling`). Units the
+  game places by script (boss segments, explosion effects) sit at the origin.
 - **Textures**: DXT1/3/5, swizzled 32-bit and R5G6B5, linear 16-bit masks, and the P8 lightmap
   atlases.
 
