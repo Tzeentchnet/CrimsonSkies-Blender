@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "crimson_skies_importer"
+version = "1.1.0"
+name = "Crimson Skies Importer"
+tagline = "Import Crimson Skies PC and Xbox models, levels and animations"
+maintainer = "CrimsonSkies-Blender"
+type = "add-on"
+
+blender_version_min = "4.4.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+category = "Import-Export"
+
+[permissions]
+files = "Read game archives and disc images, write decoded textures"
+
+[build]
+paths_exclude_pattern = ["__pycache__/", "*.pyc", "/.git/"]
